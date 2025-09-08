@@ -45,7 +45,6 @@
 #define N 200000000      // Vector length 
 #define BLOCK_SIZE 256   
 #define GRID_SIZE  64    
-#define TOLERANCE 1e-3f
 
 // Global variables
 float *A_CPU, *B_CPU, *C_CPU; //CPU pointers
