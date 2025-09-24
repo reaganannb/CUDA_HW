@@ -244,7 +244,8 @@ int main()
 	// Copy Memory from GPU to CPU	
 	cudaMemcpyAsync(C_CPU, C_GPU, 1*sizeof(float), cudaMemcpyDeviceToHost);
 	cudaErrorCheck(__FILE__, __LINE__);
-	
+
+	//adds final result
 	double acc = 0.0;
     for (unsigned int i = 0; i < GridSize.x; i++) acc += (double)C_CPU[i];
     DotGPU = (float)acc;
