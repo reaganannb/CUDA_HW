@@ -1,4 +1,4 @@
-// Name:
+// Name: Reagan Burleson
 // Histogram useing atomics in global memory and shared memory.
 // nvcc 12HistogramUseingAtomics.cu -o temp
 
