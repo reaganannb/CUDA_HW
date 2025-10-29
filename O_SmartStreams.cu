@@ -1,4 +1,4 @@
-// Name:
+// Name: Reagan Burleson
 // Two streams overlapped smartly 
 // nvcc 15SmartStreams.cu -o temp
 /*
