@@ -1,6 +1,7 @@
 // Name: Reagan Burleson
 // Optimizing nBody GPU code. 
-// nvcc nBodySpeedChallenge.cu -o temp -lglut -lm -lGLU -lGL
+// nvcc -O3 --use_fast_math -arch=sm_75 -Xptxas -O3,-dlcm=ca,-v  V_nBodySpeedChallenge.cu -o temp -lglut -lm -lGLU -lGL
+
 
 /*
  What to do:
@@ -36,7 +37,7 @@
 #include <sys/time.h>
 
 // Defines
-#define BLOCK_SIZE 1024
+#define BLOCK_SIZE 256
 #define PI 3.14159265359
 #define DRAW_RATE 10
 
@@ -55,14 +56,16 @@
 
 // Globals
 int N, DrawFlag;
-float3 *P, *V, *F;
-float *M, *MInv; 
-float3 *PGPU, *VGPU, *FGPU;
-float *MGPU, *MInvGPU;
+float3 *P, *V;
+float *M; 
+float3 *PGPU, *VGPU;
+float *MGPU;
 float GlobeRadius, Diameter, Radius;
 float Damp;
 dim3 BlockSize;
 dim3 GridSize;
+size_t ShmemBytes = 0;
+
 
 // Function prototypes
 void cudaErrorCheck(const char *, int);
@@ -105,6 +108,8 @@ void keyPressed(unsigned char key, int x, int y)
 	}
 }
 
+static inline int isPowerOfTwo(int x){ return x > 0 && (x & (x-1)) == 0; }
+
 // Calculating elasped time.
 long elaspedTime(struct timeval start, struct timeval end)
 {
@@ -120,16 +125,15 @@ long elaspedTime(struct timeval start, struct timeval end)
 
 void drawPicture()
 {
-	int i;
-	
 	glClear(GL_COLOR_BUFFER_BIT);
 	glClear(GL_DEPTH_BUFFER_BIT);
 	
 	cudaMemcpyAsync(P, PGPU, N*sizeof(float3), cudaMemcpyDeviceToHost);
 	cudaErrorCheck(__FILE__, __LINE__);
+	cudaStreamSynchronize(0);
 	
 	glColor3d(1.0,1.0,0.5);
-	for(i=0; i<N; i++)
+	for(int i=0; i<N; i++)
 	{
 		glPushMatrix();
 		glTranslatef(P[i].x, P[i].y, P[i].z);
@@ -165,29 +169,23 @@ void setup()
 	float d, dx, dy, dz;
 	int test;
     	
-    BlockSize.x = BLOCK_SIZE;
-	BlockSize.y = 1;
-	BlockSize.z = 1;
-	
-	GridSize.x = (N - 1)/BlockSize.x + 1; //Makes enough blocks to deal with the whole vector.
-	GridSize.y = 1;
-	GridSize.z = 1;
+    BlockSize   = dim3(BLOCK_SIZE, 1, 1);
+	GridSize    = dim3(N / BLOCK_SIZE, 1, 1);  
+	ShmemBytes = BLOCK_SIZE * (sizeof(float3) + sizeof(float));
+
 	
 	Damp = 0.5;
 	
-	M = (float*)malloc(N*sizeof(float));
-	MInv = (float*)   malloc(N*sizeof(float));
-	P = (float3*)malloc(N*sizeof(float3));
-	V = (float3*)malloc(N*sizeof(float3));
+	cudaHostAlloc((void**)&P, N*sizeof(float3), cudaHostAllocDefault);
+    V = (float3*)malloc(N*sizeof(float3));
+    M = (float*)  malloc(N*sizeof(float));
 	
 	cudaMalloc(&MGPU,N*sizeof(float));
-	cudaErrorCheck(__FILE__, __LINE__);
-	cudaMalloc(&MInvGPU, N*sizeof(float));
     cudaErrorCheck(__FILE__, __LINE__);
-	cudaMalloc(&PGPU,N*sizeof(float3));
-	cudaErrorCheck(__FILE__, __LINE__);
-	cudaMalloc(&VGPU,N*sizeof(float3));
-	cudaErrorCheck(__FILE__, __LINE__);
+    cudaMalloc(&PGPU,N*sizeof(float3));
+    cudaErrorCheck(__FILE__, __LINE__);
+    cudaMalloc(&VGPU,N*sizeof(float3));
+    cudaErrorCheck(__FILE__, __LINE__);
     	
 	Diameter = pow(H/G, 1.0/(LJQ - LJP)); // This is the value where the force is zero for the L-J type force.
 	Radius = Diameter/2.0;
@@ -222,178 +220,136 @@ void setup()
 				dy = P[i].y-P[j].y;
 				dz = P[i].z-P[j].z;
 				d = sqrt(dx*dx + dy*dy + dz*dz);
-				if(d < Diameter)
-				{
-					test = 0;
-					break;
-				}
+				if(d < Diameter) { test = 0; break; }
 			}
 		}
 	
-		V[i].x = 0.0;
-		V[i].y = 0.0;
-		V[i].z = 0.0;
-		
-		M[i] = 1.0;
-		MInv[i] = 1.0f;
+		V[i].x = V[i].y = V[i].z = 0.0f;
+        M[i]   = 1.0f;
 	}
 	
 	cudaMemcpyAsync(PGPU, P, N*sizeof(float3), cudaMemcpyHostToDevice);
-	cudaErrorCheck(__FILE__, __LINE__);
-	cudaMemcpyAsync(VGPU, V, N*sizeof(float3), cudaMemcpyHostToDevice);
-	cudaErrorCheck(__FILE__, __LINE__);
-	cudaMemcpyAsync(MGPU, M, N*sizeof(float), cudaMemcpyHostToDevice);
-	cudaErrorCheck(__FILE__, __LINE__);
-	cudaMemcpy(MInvGPU, MInv, N*sizeof(float),  cudaMemcpyHostToDevice);
+    cudaErrorCheck(__FILE__, __LINE__);
+    cudaMemcpyAsync(VGPU, V, N*sizeof(float3), cudaMemcpyHostToDevice);
+    cudaErrorCheck(__FILE__, __LINE__);
+    cudaMemcpyAsync(MGPU, M, N*sizeof(float), cudaMemcpyHostToDevice);
     cudaErrorCheck(__FILE__, __LINE__);
 	
 	printf("\n To start timing go to the nBody window and type s.\n");
 	printf("\n To quit type q in the nBody window.\n");
 }
 
-__global__ void stepBodies(float3 *__restrict__ p,
-                           float3 *__restrict__ v,
-                           const float *__restrict__ m,
-                           const float *__restrict__ invM,
-                           float damp, float dt, float t,
-                           float g, float h,
-                           int n)
+__global__ __launch_bounds__(BLOCK_SIZE, 2)
+void stepBodies(float3 *__restrict__ p,
+                float3 *__restrict__ v,
+                const float *__restrict__ m,
+                float g, float h,
+                float damp, float dt,
+                float t, int n,int useHalfKick)
 {
-    extern __shared__ float shmem[];
-    float3* sPos  = (float3*)shmem;
-    float*  sMass = (float*)&sPos[blockDim.x];
+    extern __shared__ unsigned char smem[];
+    float3* tileP = (float3*)smem;
+    float*  tileM = (float*)(tileP + blockDim.x);
 
-    int i = threadIdx.x + blockDim.x*blockIdx.x;
-    if (i >= n) return;
+    int i = threadIdx.x + blockDim.x * blockIdx.x;
+    if (i >= n) return;   
 
-    float3 myPos  = p[i];
-    float3 myVel  = v[i];
-    float  myMass = m[i];
-    float  invMass = invM[i];
+    float3 pi = p[i];
+    float3 vi = v[i];
+    float   mi = m[i];
 
-    float3 acc;
-    acc.x = 0.0f;
-    acc.y = 0.0f;
-    acc.z = 0.0f;
+    float3 fi; fi.x = 0.0f; fi.y = 0.0f; fi.z = 0.0f;
 
-    float gMy = g * myMass;
-    float hMy = h * myMass;
+    for (int tile = 0; tile < n; tile += blockDim.x) {
+        int j = tile + threadIdx.x;
 
-    // Loop over tiles of bodies
-    for (int tile = 0; tile < n; tile += blockDim.x)
-    {
-        int idx = tile + threadIdx.x;
-        if (idx < n)
-        {
-            sPos[threadIdx.x]  = p[idx];
-            sMass[threadIdx.x] = m[idx];
-        }
-        else
-        {
-            sPos[threadIdx.x].x = 0.0f;
-            sPos[threadIdx.x].y = 0.0f;
-            sPos[threadIdx.x].z = 0.0f;
-            sMass[threadIdx.x]  = 0.0f;
-        }
+        // no if(j<n) because N is multiple of blockDim.x
+        tileP[threadIdx.x] = p[j];
+        tileM[threadIdx.x] = m[j];
+
         __syncthreads();
 
-        int tileSize = min(blockDim.x, n - tile);
-        int selfIdx  = (i >= tile && i < tile + tileSize) ? (i - tile) : -1;
+        #pragma unroll 8
+		for (int k = 0; k < blockDim.x; ++k) {
+			int idx = tile + k;
+			if (idx == i) continue;
 
-        #pragma unroll 4
-        for (int j = 0; j < tileSize; ++j)
-        {
-            if (j == selfIdx) continue;
+			float dx = tileP[k].x - pi.x;
+			float dy = tileP[k].y - pi.y;
+			float dz = tileP[k].z - pi.z;
 
-            float mj = sMass[j];
+			float d2     = dx*dx + dy*dy + dz*dz + 1e-8f;
+			float inv_d  = rsqrtf(d2);
+			float inv_d2 = inv_d * inv_d;
+			float inv_d4 = inv_d2 * inv_d2;
 
-            float dx = sPos[j].x - myPos.x;
-            float dy = sPos[j].y - myPos.y;
-            float dz = sPos[j].z - myPos.z;
+			float mk    = tileM[k];
+			float mm    = mi * mk;
+			float coeff = g * inv_d2 - h * inv_d4;
+			float s     = (mm * coeff) * inv_d;
 
-            float d2 = dx*dx + dy*dy + dz*dz + 1e-9f; // avoid 0
-            float invDist  = rsqrtf(d2);        // 1 / r
-            float invDist2 = invDist * invDist; // 1 / r^2
-            float invDist3 = invDist2 * invDist;
-            float invDist5 = invDist3 * invDist2;
+			fi.x += s * dx;
+			fi.y += s * dy;
+			fi.z += s * dz;
+		}
 
-            // (G/r^2 - H/r^4)*(vec/r) = (G/r^3 - H/r^5)*vec
-            float scale = (gMy * mj * invDist3) - (hMy * mj * invDist5);
-
-            acc.x += scale * dx;
-            acc.y += scale * dy;
-            acc.z += scale * dz;
-        }
         __syncthreads();
     }
 
-    // Integrate: same logic as moveBodies, but using acc directly
-    if(t == 0.0f)
-    {
-        float factor = dt * 0.5f;
-        myVel.x += (acc.x - damp*myVel.x) * invMass * factor;
-        myVel.y += (acc.y - damp*myVel.y) * invMass * factor;
-        myVel.z += (acc.z - damp*myVel.z) * invMass * factor;
-    }
-    else
-    {
-        float factor = dt;
-        myVel.x += (acc.x - damp*myVel.x) * invMass * factor;
-        myVel.y += (acc.y - damp*myVel.y) * invMass * factor;
-        myVel.z += (acc.z - damp*myVel.z) * invMass * factor;
-    }
+    float inv_m = 1.0f / mi;
+    float ax = (fi.x - damp * vi.x) * inv_m;
+    float ay = (fi.y - damp * vi.y) * inv_m;
+    float az = (fi.z - damp * vi.z) * inv_m;
 
-    myPos.x += myVel.x * dt;
-    myPos.y += myVel.y * dt;
-    myPos.z += myVel.z * dt;
+    float scale = dt;
+	if (useHalfKick && t == 0.0f) {
+		scale = 0.5f * dt;
+	}
 
-    // Write back
-    v[i] = myVel;
-    p[i] = myPos;
+    vi.x += ax * scale;
+    vi.y += ay * scale;
+    vi.z += az * scale;
+
+    pi.x += vi.x * dt;
+    pi.y += vi.y * dt;
+    pi.z += vi.z * dt;
+
+    v[i] = vi;
+    p[i] = pi;
 }
+
+
+
 
 void nBody()
 {
-	int    drawCount = 0; 
-	float  t = 0.0;
-	float dt = 0.0001;
+    int   drawCount = 0;
+    float t         = 0.0f;
+    float dt        = 0.0001f;
+	int useHalfKick = DrawFlag ? 1 : 0;
 
-	size_t shmemSize = (sizeof(float3) + sizeof(float)) * BLOCK_SIZE;
 
-	while(t < RUN_TIME)
-	{
-		int steps = STEPS_PER_LAUNCH;
-        if (t + steps*dt > RUN_TIME)
-        {
-            steps = (int)((RUN_TIME - t)/dt);
-            if (steps <= 0) break;
-        }
-
-        for (int s = 0; s < steps; ++s)
-        {
-            stepBodies<<<GridSize, BlockSize, shmemSize>>>(PGPU, VGPU, MGPU,
-                                                            MInvGPU,
-                                                           Damp, dt, t,
-                                                           G, H,
-                                                           N);
-            cudaErrorCheck(__FILE__, __LINE__);
-
-            t += dt;
-            drawCount++;
-        }
-		if(drawCount == DRAW_RATE) 
-		{
-			if(DrawFlag) 
-			{	
-				drawPicture();
-			}
-			drawCount = 0;
-		}
+    while (t < RUN_TIME)
+    {
+        stepBodies<<<GridSize, BlockSize, ShmemBytes>>>(
+            PGPU, VGPU, MGPU,
+            G, H,
+            Damp, dt,
+            t, N, useHalfKick
+        );
 		
-		t += dt;
-		drawCount++;
-	}
+        cudaErrorCheck(__FILE__, __LINE__);
+
+        if (drawCount == DRAW_RATE) {
+            if (DrawFlag) { drawPicture(); }
+            drawCount = 0;
+        }
+
+        t += dt;
+        drawCount++;
+    }
 }
+
 
 int main(int argc, char** argv)
 {
@@ -409,6 +365,13 @@ int main(int argc, char** argv)
 		N = atoi(argv[1]);
 		DrawFlag = atoi(argv[2]);
 	}
+
+	if (!isPowerOfTwo(N) || N <= 256 || N >= 262144) {
+        printf("\n N must be a power of 2 with 256 < N < 262,144. You gave %d.\n", N);
+        exit(0);
+    }
+
+	cudaDeviceSetCacheConfig(cudaFuncCachePreferShared);
 	
 	setup();
 	
